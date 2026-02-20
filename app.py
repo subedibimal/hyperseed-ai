@@ -54,6 +54,7 @@ DEFAULT_CLAUDE_MODELS = [
 ]
 DEFAULT_BOLD_API_BASE_URL = "https://api.avionte.com/front-office"
 BOLD_CREATE_HCM_USER_PATH = "/v1/user"
+BOLD_CREATE_TALENT_PATH = "/v1/talent"
 BOLD_CREATE_TALENT_USER_PATH = "/v1/user/talent-user"
 DEFAULT_HCM_EMAIL_DOMAIN = "seed.bold.local"
 # ---------------------------
@@ -900,6 +901,208 @@ def build_hcm_user_payload(
     return {k: v for k, v in payload.items() if v not in {"", None}}
 
 
+def iso8601_utc(days_offset: int = 0) -> str:
+    timestamp = time.time() + (int(days_offset) * 86400)
+    return time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(timestamp))
+
+
+def build_talent_address(city: str, state_code: str) -> Dict[str, str]:
+    return {
+        "street1": fake.street_address(),
+        "street2": "Suite 100",
+        "city": city or "St. Paul",
+        "state_Province": state_code or "MN",
+        "postalCode": fake.numerify(text="#####"),
+        "country": "US",
+        "county": "Dakota",
+        "geoCode": fake.numerify(text="#########"),
+        "schoolDistrictCode": "00000",
+    }
+
+
+def build_talent_payload(
+    row: Dict[str, Any],
+    front_office_id: int,
+    email_run_suffix: str = "",
+) -> Dict[str, Any]:
+    first_name = str(row.get("first_name") or "John").strip() or "John"
+    middle_name = fake.first_name()
+    last_name = str(row.get("last_name") or "Smith").strip() or "Smith"
+
+    raw_email = str(row.get("email") or "").strip().lower()
+    if "@" in raw_email:
+        email_local_part, email_domain = raw_email.split("@", 1)
+    else:
+        default_local = re.sub(r"[^a-z0-9]+", "", f"{first_name}.{last_name}".lower())
+        email_local_part = default_local or f"tal{int(time.time())}"
+        email_domain = DEFAULT_HCM_EMAIL_DOMAIN
+
+    email_local_part = re.sub(r"[^a-z0-9._-]+", "", email_local_part) or f"tal{int(time.time())}"
+    email_domain = re.sub(r"[^a-z0-9.-]+", "", email_domain) or DEFAULT_HCM_EMAIL_DOMAIN
+    if email_run_suffix:
+        email_local_part = f"{email_local_part}-{email_run_suffix}"
+
+    email_address = f"{email_local_part}@{email_domain}"
+    email_address2 = f"{email_local_part}-alt@{email_domain}"
+
+    location = str(row.get("location") or "").strip()
+    city, state = split_location(location)
+    city_name = city.strip() if city else "St. Paul"
+    state_code = ((state or "MN").strip()[:2] or "MN").upper()
+
+    resident_address = build_talent_address(city=city_name, state_code=state_code)
+    mailing_address = dict(resident_address)
+    payroll_address = dict(resident_address)
+    extra_address = dict(resident_address)
+
+    origin_record_id = re.sub(r"[^A-Za-z0-9]+", "", str(row.get("id") or "")).upper()[:24]
+    if not origin_record_id:
+        origin_record_id = uuid.uuid4().hex[:12].upper()
+
+    entered_by_user = f"seedrecruiter@{email_domain}"
+    representative_user_email = f"rep.{email_local_part}@{email_domain}"
+
+    birthday = f"{fake.date_of_birth(minimum_age=21, maximum_age=65).isoformat()}T00:00:00.000Z"
+    hire_date = iso8601_utc(days_offset=-random.randint(365, 9000))
+    i9_validated_date = iso8601_utc(days_offset=-random.randint(365, 7000))
+    latest_activity_date = iso8601_utc(days_offset=-random.randint(0, 90))
+    availability_date = iso8601_utc(days_offset=-random.randint(30, 3650))
+    created_date = iso8601_utc(days_offset=-random.randint(365, 4000))
+    last_updated_date = iso8601_utc(days_offset=-random.randint(0, 180))
+    last_contacted = iso8601_utc(days_offset=-random.randint(0, 120))
+    rehire_date = iso8601_utc(days_offset=-random.randint(365, 9000))
+    termination_date = iso8601_utc(days_offset=-random.randint(0, 365))
+
+    payload = {
+        "firstName": first_name,
+        "middleName": middle_name,
+        "lastName": last_name,
+        "homePhone": fake.numerify(text="###-###-####"),
+        "workPhone": fake.numerify(text="###-###-####"),
+        "mobilePhone": f"+1{fake.numerify(text='##########')}",
+        "pageNumber": f"({fake.numerify(text='###')}) {fake.numerify(text='###')}-{fake.numerify(text='####')}",
+        "emailAddress": email_address,
+        "emailAddress2": email_address2,
+        "taxIdNumber": fake.numerify(text="#########"),
+        "birthday": birthday,
+        "gender": random.choice(["M", "F"]),
+        "hireDate": hire_date,
+        "residentAddress": resident_address,
+        "mailingAddress": mailing_address,
+        "payrollAddress": payroll_address,
+        "addresses": [resident_address, extra_address],
+        "status": "Active",
+        "filingStatus": random.choice(["Single", "Married"]),
+        "federalAllowances": 1,
+        "stateAllowances": 1,
+        "additionalFederalWithholding": 0,
+        "i9ValidatedDate": i9_validated_date,
+        "frontOfficeId": int(front_office_id),
+        "latestActivityDate": latest_activity_date,
+        "latestActivityName": "Interview",
+        "link": f"http://example.myavionte.com/app/#/applicant/{fake.numerify(text='#######')}",
+        "race": "White (Not Hispanic or Latino)",
+        "disability": "Individual without Disabilities",
+        "veteranStatus": "Non Veteran",
+        "emailOptOut": False,
+        "isArchived": False,
+        "placementStatus": "Active Contractor",
+        "w2Consent": True,
+        "electronic1095CConsent": True,
+        "referredBy": "Partner API Seed",
+        "availabilityDate": availability_date,
+        "officeName": "Branch A",
+        "officeDivision": "ABC Staffing",
+        "enteredByUserId": 19842,
+        "enteredByUser": entered_by_user,
+        "representativeUserEmail": representative_user_email,
+        "createdDate": created_date,
+        "lastUpdatedDate": last_updated_date,
+        "latestWork": f"{str(row.get('job_title') or 'General Laborer')} - Contractor",
+        "lastContacted": last_contacted,
+        "flag": random.choice(["Green", "Yellow"]),
+        "origin": "A+ PartnerAPI",
+        "originRecordId": origin_record_id,
+        "electronic1099Consent": True,
+        "textConsent": "Opt In",
+        "rehireDate": rehire_date,
+        "terminationDate": termination_date,
+        "employmentTypeId": 343,
+        "employmentType": "W-2",
+        "employmentTypeName": "Custom W2",
+    }
+
+    return payload
+
+
+def extract_talent_id_from_response(response_body: str) -> Tuple[int, str]:
+    def as_positive_int(value: Any) -> int | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value if value > 0 else None
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped.isdigit():
+                parsed = int(stripped)
+                return parsed if parsed > 0 else None
+        return None
+
+    def from_json_obj(data: Any) -> int | None:
+        direct = as_positive_int(data)
+        if direct:
+            return direct
+
+        if isinstance(data, dict):
+            for key in ("talentId", "talentID", "TalentId", "id", "Id"):
+                parsed = as_positive_int(data.get(key))
+                if parsed:
+                    return parsed
+
+            for container_key in ("data", "result", "value", "payload", "talent"):
+                if container_key in data:
+                    parsed = from_json_obj(data.get(container_key))
+                    if parsed:
+                        return parsed
+
+            for key, value in data.items():
+                if "talent" in str(key).lower():
+                    parsed = from_json_obj(value)
+                    if parsed:
+                        return parsed
+
+        if isinstance(data, list):
+            for item in data:
+                parsed = from_json_obj(item)
+                if parsed:
+                    return parsed
+
+        return None
+
+    body = str(response_body or "").strip()
+    if not body:
+        return 0, "empty_response"
+
+    if body.isdigit():
+        parsed = int(body)
+        return (parsed, "plain_numeric_body") if parsed > 0 else (0, "plain_numeric_body")
+
+    try:
+        parsed_body = json.loads(body)
+    except Exception:
+        parsed_body = None
+
+    parsed_from_json = from_json_obj(parsed_body)
+    if parsed_from_json:
+        return parsed_from_json, "json_body"
+
+    match = re.search(r'"talentId"\s*:\s*(\d+)', body, flags=re.IGNORECASE)
+    if match:
+        return int(match.group(1)), "regex_body"
+
+    return 0, "talent_id_not_found"
+
+
 def mask_secret(value: str) -> str:
     raw = str(value or "")
     if not raw:
@@ -950,12 +1153,13 @@ def post_bold_payload(
         except Exception:
             body_text = (response.text or "").strip()
 
-        if len(body_text) > 400:
-            body_text = body_text[:400] + "..."
+        response_preview = body_text
+        if len(response_preview) > 400:
+            response_preview = response_preview[:400] + "..."
 
         debug_log["status_code"] = int(response.status_code)
         debug_log["ok"] = bool(response.ok)
-        debug_log["response_body"] = body_text
+        debug_log["response_body"] = response_preview
         return response.ok, int(response.status_code), body_text, debug_log
     except Exception as exc:
         error_text = f"request_error:{exc.__class__.__name__}:{exc}"
@@ -1019,13 +1223,144 @@ def insert_hcm_users_to_bold(
     return summary
 
 
+def insert_generated_talent_to_bold(
+    base_url: str,
+    common_headers: Dict[str, str],
+    talent_rows: List[Dict[str, Any]],
+    front_office_id: int,
+    legacy_work_n: bool,
+    call_timeout_seconds: int,
+    capture_debug_logs: bool,
+    expose_sensitive_logs: bool,
+) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {
+        "attempted": 0,
+        "success": 0,
+        "failed": 0,
+        "talent_created": 0,
+        "talent_user_created": 0,
+        "errors": [],
+        "debug_logs": [],
+    }
+    email_run_suffix = uuid.uuid4().hex[:8]
+
+    for row in talent_rows:
+        seed_id = str(row.get("id", ""))
+        summary["attempted"] += 1
+
+        create_headers = dict(common_headers)
+        create_headers["RequestId"] = str(uuid.uuid4())
+        create_payload = build_talent_payload(
+            row=row,
+            front_office_id=front_office_id,
+            email_run_suffix=email_run_suffix,
+        )
+
+        create_ok, create_status, create_response, create_debug_log = post_bold_payload(
+            base_url=base_url,
+            path=BOLD_CREATE_TALENT_PATH,
+            headers=create_headers,
+            payload=create_payload,
+            timeout_seconds=call_timeout_seconds,
+            expose_sensitive_logs=expose_sensitive_logs,
+        )
+
+        if capture_debug_logs and len(summary["debug_logs"]) < 50:
+            create_debug_log["stage"] = "create_talent"
+            create_debug_log["seed_id"] = seed_id
+            summary["debug_logs"].append(create_debug_log)
+
+        create_response_preview = (
+            create_response
+            if len(create_response) <= 400
+            else create_response[:400] + "..."
+        )
+
+        if not create_ok:
+            summary["failed"] += 1
+            if len(summary["errors"]) < 20:
+                summary["errors"].append(
+                    {
+                        "seed_id": seed_id,
+                        "stage": "create_talent",
+                        "status_code": int(create_status),
+                        "response": create_response_preview,
+                        "url": create_debug_log.get("url", ""),
+                    }
+                )
+            continue
+
+        summary["talent_created"] += 1
+        created_talent_id, talent_id_source = extract_talent_id_from_response(create_response)
+        if created_talent_id <= 0:
+            summary["failed"] += 1
+            if len(summary["errors"]) < 20:
+                summary["errors"].append(
+                    {
+                        "seed_id": seed_id,
+                        "stage": "parse_talent_id",
+                        "status_code": int(create_status),
+                        "response": create_response_preview,
+                        "url": create_debug_log.get("url", ""),
+                    }
+                )
+            continue
+
+        link_headers = dict(common_headers)
+        link_headers["RequestId"] = str(uuid.uuid4())
+        link_payload = {
+            "talentId": int(created_talent_id),
+            "legacyWorkN": bool(legacy_work_n),
+        }
+
+        link_ok, link_status, link_response, link_debug_log = post_bold_payload(
+            base_url=base_url,
+            path=BOLD_CREATE_TALENT_USER_PATH,
+            headers=link_headers,
+            payload=link_payload,
+            timeout_seconds=call_timeout_seconds,
+            expose_sensitive_logs=expose_sensitive_logs,
+        )
+
+        if capture_debug_logs and len(summary["debug_logs"]) < 50:
+            link_debug_log["stage"] = "create_talent_user"
+            link_debug_log["seed_id"] = seed_id
+            link_debug_log["created_talent_id"] = int(created_talent_id)
+            link_debug_log["talent_id_source"] = talent_id_source
+            summary["debug_logs"].append(link_debug_log)
+
+        link_response_preview = link_response if len(link_response) <= 400 else link_response[:400] + "..."
+
+        if link_ok:
+            summary["success"] += 1
+            summary["talent_user_created"] += 1
+        else:
+            summary["failed"] += 1
+            if len(summary["errors"]) < 20:
+                summary["errors"].append(
+                    {
+                        "seed_id": seed_id,
+                        "stage": "create_talent_user",
+                        "talent_id": int(created_talent_id),
+                        "status_code": int(link_status),
+                        "response": link_response_preview,
+                        "url": link_debug_log.get("url", ""),
+                    }
+                )
+
+    return summary
+
+
 def insert_talent_users_to_bold(
     base_url: str,
     common_headers: Dict[str, str],
     talent_ids: List[int],
     legacy_work_n: bool,
+    call_timeout_seconds: int = 30,
+    capture_debug_logs: bool = False,
+    expose_sensitive_logs: bool = False,
 ) -> Dict[str, Any]:
-    summary: Dict[str, Any] = {"attempted": 0, "success": 0, "failed": 0, "errors": []}
+    summary: Dict[str, Any] = {"attempted": 0, "success": 0, "failed": 0, "errors": [], "debug_logs": []}
 
     for talent_id in talent_ids:
         headers = dict(common_headers)
@@ -1035,12 +1370,19 @@ def insert_talent_users_to_bold(
             "talentId": int(talent_id),
             "legacyWorkN": bool(legacy_work_n),
         }
-        ok, status_code, response_body, _ = post_bold_payload(
+        ok, status_code, response_body, debug_log = post_bold_payload(
             base_url=base_url,
             path=BOLD_CREATE_TALENT_USER_PATH,
             headers=headers,
             payload=payload,
+            timeout_seconds=call_timeout_seconds,
+            expose_sensitive_logs=expose_sensitive_logs,
         )
+
+        if capture_debug_logs and len(summary["debug_logs"]) < 25:
+            debug_log["stage"] = "create_talent_user"
+            debug_log["talent_id"] = int(talent_id)
+            summary["debug_logs"].append(debug_log)
 
         summary["attempted"] += 1
         if ok:
@@ -1516,8 +1858,9 @@ if result:
     with st.expander("Insert generated users into BOLD", expanded=False):
         bold_config = get_bold_config_from_env()
         st.caption(
-            "Calls CreateHCMUser (POST /v1/user) using .env credentials and auto-generated access token. "
-            "Talent user insertion will be added later."
+            "Calls CreateHCMUser (POST /v1/user) and the Talent flow "
+            "CreateTalent (POST /v1/talent) -> CreateTalentUser (POST /v1/user/talent-user), "
+            "using .env credentials and auto-generated access token."
         )
 
         scope_mode = "Tenant" if bold_config["tenant"] else "FrontOfficeTenantId" if bold_config["front_office_tenant_id"] else "missing"
@@ -1526,18 +1869,37 @@ if result:
 
         home_office_id = env_first_int(["BOLD_HOME_OFFICE_ID", "HomeOfficeId", "HOME_OFFICE_ID"], 1)
         user_type_id = env_first_int(["BOLD_USER_TYPE_ID", "UserTypeId", "USER_TYPE_ID"], 1)
-
-        max_rows_to_push = st.number_input(
-            "Max HCM rows to push",
-            min_value=1,
-            max_value=5000,
-            value=50,
-            step=10,
+        talent_front_office_id = env_first_int(
+            ["BOLD_TALENT_FRONT_OFFICE_ID", "BOLD_FRONT_OFFICE_ID", "FrontOfficeId", "FRONT_OFFICE_ID"],
+            111,
         )
 
-        hcm_rows_to_push = result["hcm_data"][: int(max_rows_to_push)]
+        insert_col1, insert_col2 = st.columns(2)
+        with insert_col1:
+            max_hcm_rows_to_push = st.number_input(
+                "Max HCM rows to push",
+                min_value=1,
+                max_value=5000,
+                value=50,
+                step=10,
+            )
+        with insert_col2:
+            max_talent_rows_to_push = st.number_input(
+                "Max Talent rows to push",
+                min_value=1,
+                max_value=5000,
+                value=50,
+                step=10,
+            )
 
-        st.caption(f"Ready to push: HCM={len(hcm_rows_to_push)} row(s).")
+        hcm_rows_to_push = result["hcm_data"][: int(max_hcm_rows_to_push)]
+        talent_rows_to_push = result["talent_data"][: int(max_talent_rows_to_push)]
+        legacy_work_n = st.checkbox("legacyWorkN for CreateTalentUser", value=False)
+
+        st.caption(
+            f"Ready to push: HCM={len(hcm_rows_to_push)} row(s), Talent={len(talent_rows_to_push)} row(s), "
+            f"Talent frontOfficeId={int(talent_front_office_id)}"
+        )
         capture_debug_logs = st.checkbox(
             "Capture detailed API logs (URL, headers, payload, response)",
             value=True,
@@ -1549,15 +1911,19 @@ if result:
                 value=False,
             )
 
-        if st.button("Insert HCM users to BOLD", type="secondary"):
+        button_col1, button_col2 = st.columns(2)
+        with button_col1:
+            run_hcm_insert = st.button("Insert HCM users to BOLD", type="secondary")
+        with button_col2:
+            run_talent_insert = st.button("Insert Talent users to BOLD", type="secondary")
+
+        if run_hcm_insert or run_talent_insert:
             if requests is None:
                 st.error("`requests` is not installed. Install dependencies from requirements.txt and retry.")
             elif not bold_config["base_url"]:
                 st.error("BOLD API base URL is required.")
             elif not (bold_config["tenant"] or bold_config["front_office_tenant_id"]):
                 st.error("Provide Tenant or FrontOfficeTenantId header value.")
-            elif not hcm_rows_to_push:
-                st.warning("No HCM rows available to push. Generate HCM data first.")
             else:
                 token_ok, bearer_token, token_status = get_bold_bearer_token(bold_config)
                 if not token_ok:
@@ -1586,35 +1952,82 @@ if result:
                             height=110,
                         )
 
-                    hcm_summary = {"attempted": 0, "success": 0, "failed": 0, "errors": []}
+                    if run_hcm_insert:
+                        if not hcm_rows_to_push:
+                            st.warning("No HCM rows available to push. Generate HCM data first.")
+                        else:
+                            hcm_summary = {"attempted": 0, "success": 0, "failed": 0, "errors": []}
 
-                    with st.spinner("Calling CreateHCMUser endpoint..."):
-                        hcm_summary = insert_hcm_users_to_bold(
-                            base_url=bold_config["base_url"],
-                            common_headers=common_headers,
-                            hcm_rows=hcm_rows_to_push,
-                            home_office_id=int(home_office_id),
-                            user_type_id=int(user_type_id),
-                            call_timeout_seconds=max(1, int(bold_config["call_timeout"])),
-                            capture_debug_logs=capture_debug_logs,
-                            expose_sensitive_logs=expose_sensitive_logs,
-                        )
+                            with st.spinner("Calling CreateHCMUser endpoint..."):
+                                hcm_summary = insert_hcm_users_to_bold(
+                                    base_url=bold_config["base_url"],
+                                    common_headers=common_headers,
+                                    hcm_rows=hcm_rows_to_push,
+                                    home_office_id=int(home_office_id),
+                                    user_type_id=int(user_type_id),
+                                    call_timeout_seconds=max(1, int(bold_config["call_timeout"])),
+                                    capture_debug_logs=capture_debug_logs,
+                                    expose_sensitive_logs=expose_sensitive_logs,
+                                )
 
-                    st.caption(f"Access token source: {token_status}")
-                    st.write("CreateHCMUser results")
-                    st.write(
-                        f"Attempted: {hcm_summary['attempted']} | "
-                        f"Succeeded: {hcm_summary['success']} | Failed: {hcm_summary['failed']}"
-                    )
-                    if hcm_summary["errors"]:
-                        st.dataframe(hcm_summary["errors"], width="stretch")
+                            st.caption(f"Access token source: {token_status}")
+                            st.write("CreateHCMUser results")
+                            st.write(
+                                f"Attempted: {hcm_summary['attempted']} | "
+                                f"Succeeded: {hcm_summary['success']} | Failed: {hcm_summary['failed']}"
+                            )
+                            if hcm_summary["errors"]:
+                                st.dataframe(hcm_summary["errors"], width="stretch")
 
-                    if capture_debug_logs and hcm_summary["debug_logs"]:
-                        with st.expander("Detailed API debug logs", expanded=True):
-                            st.json(hcm_summary["debug_logs"])
+                            if capture_debug_logs and hcm_summary["debug_logs"]:
+                                with st.expander("Detailed HCM API debug logs", expanded=True):
+                                    st.json(hcm_summary["debug_logs"])
 
-                    if hcm_summary["failed"] == 0 and hcm_summary["attempted"] > 0:
-                        st.success("CreateHCMUser insertion completed successfully.")
+                            if hcm_summary["failed"] == 0 and hcm_summary["attempted"] > 0:
+                                st.success("CreateHCMUser insertion completed successfully.")
+
+                    if run_talent_insert:
+                        if not talent_rows_to_push:
+                            st.warning("No Talent rows available to push. Generate Talent data first.")
+                        else:
+                            talent_summary = {
+                                "attempted": 0,
+                                "success": 0,
+                                "failed": 0,
+                                "talent_created": 0,
+                                "talent_user_created": 0,
+                                "errors": [],
+                            }
+
+                            with st.spinner("Calling CreateTalent and CreateTalentUser endpoints..."):
+                                talent_summary = insert_generated_talent_to_bold(
+                                    base_url=bold_config["base_url"],
+                                    common_headers=common_headers,
+                                    talent_rows=talent_rows_to_push,
+                                    front_office_id=int(talent_front_office_id),
+                                    legacy_work_n=legacy_work_n,
+                                    call_timeout_seconds=max(1, int(bold_config["call_timeout"])),
+                                    capture_debug_logs=capture_debug_logs,
+                                    expose_sensitive_logs=expose_sensitive_logs,
+                                )
+
+                            st.caption(f"Access token source: {token_status}")
+                            st.write("CreateTalent + CreateTalentUser results")
+                            st.write(
+                                f"Attempted: {talent_summary['attempted']} | "
+                                f"Talent created: {talent_summary['talent_created']} | "
+                                f"Talent user created: {talent_summary['talent_user_created']} | "
+                                f"Failed: {talent_summary['failed']}"
+                            )
+                            if talent_summary["errors"]:
+                                st.dataframe(talent_summary["errors"], width="stretch")
+
+                            if capture_debug_logs and talent_summary["debug_logs"]:
+                                with st.expander("Detailed Talent API debug logs", expanded=True):
+                                    st.json(talent_summary["debug_logs"])
+
+                            if talent_summary["failed"] == 0 and talent_summary["attempted"] > 0:
+                                st.success("Talent insertion flow completed successfully.")
 
 else:
     st.info("Upload a schema, choose options, then click Generate.")
