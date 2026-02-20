@@ -14,6 +14,8 @@ Hackathon project for **AI Enablement**: generate realistic high-volume HCM + Ta
    - JSON
    - Portable SQL inserts
    - SQL Server-safe BOLD seed SQL (staging tables)
+6. Optionally calls BOLD Front Office API endpoint to insert HCM users directly:
+   - `CreateHCMUser` (`POST /v1/user`)
 
 ## Quick start
 
@@ -56,6 +58,51 @@ If selected LLM is unavailable (missing key / SDK / API error), app auto-falls b
 4. Click **Generate**.
 5. Review preview + benchmark section.
 6. Download JSON / SQL outputs.
+7. (Optional) Use **Insert to BOLD API** to push generated HCM rows to BOLD.
+
+## Insert to BOLD API (optional)
+
+The app includes an **Insert HCM users to BOLD** button in section **5) Insert to BOLD API**.
+The UI is intentionally simple and reads API settings from environment variables.
+
+### Endpoints used
+
+- `POST /v1/user` (`CreateHCMUser`)
+
+### Authentication / headers
+
+The app now generates bearer token automatically from env-based credentials and sends:
+- `x-api-key`
+- `Authorization: Bearer <generated_token>`
+- `Tenant` or `FrontOfficeTenantId`
+
+Set these env vars in `.env`:
+- `BOLD_AUTH_URL`
+- `BOLD_API_KEY`
+- `BOLD_CLIENT_ID`
+- `BOLD_CLIENT_SECRET`
+- `BOLD_GRANT_TYPE` (default: `client_credentials`)
+- `BOLD_SCOPE`
+
+For base URL, set either:
+- `BOLD_API_BASE_URL`
+- or both `BOLD_SERVICE_URL` + `BOLD_URL_PATH`
+
+For HCM payload defaults:
+- `BOLD_HOME_OFFICE_ID`
+- `BOLD_USER_TYPE_ID`
+
+Optional:
+- `BOLD_BEARER_TOKEN` (if set, token-generation call is skipped)
+- `BOLD_AUTH_TIMEOUT`, `BOLD_CALL_TIMEOUT`, `BOLD_CACHE_TIMEOUT`
+
+Compatibility aliases are also supported for your existing credential names (e.g., `AvionteAuthURL`, `ClientID`, `ClientSecret`, `Scope`, `SubscriptionKey`, `Tenant`, `AviontePrivateURL`, `AvionteServiceURL`, `AvionteURLPath`).
+
+### Important behavior
+
+- HCM insertion uses generated rows and maps them to `HcmUser` payload (`firstName`, `lastName`, `emailAddress`, `homeOfficeId`, `userTypeId`, etc.).
+- Current UI keeps this flow intentionally simple (HCM-only).
+- Talent user insertion (`CreateTalentUser`) can be added in a later phase.
 
 ## Notes for BOLD schema
 

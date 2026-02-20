@@ -5,6 +5,7 @@ import os
 import random
 import re
 import time
+import uuid
 from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -27,6 +28,11 @@ try:
 except Exception:  # pragma: no cover - optional dependency at runtime
     Anthropic = None
 
+try:
+    import requests
+except Exception:  # pragma: no cover - optional dependency at runtime
+    requests = None
+
 fake = Faker()
 PROJECT_ROOT = Path(__file__).resolve().parent
 if load_dotenv is not None:
@@ -46,6 +52,10 @@ DEFAULT_CLAUDE_MODELS = [
     "claude-3-5-sonnet-latest",
     "claude-3-opus-latest",
 ]
+DEFAULT_BOLD_API_BASE_URL = "https://api.avionte.com/front-office"
+BOLD_CREATE_HCM_USER_PATH = "/v1/user"
+BOLD_CREATE_TALENT_USER_PATH = "/v1/user/talent-user"
+DEFAULT_HCM_EMAIL_DOMAIN = "seed.bold.local"
 # ---------------------------
 # 1) Schema decoding + parser
 # ---------------------------
@@ -656,6 +666,400 @@ def generate_dataset(
 
 
 # ---------------------------
+# 3b) BOLD API insert helpers
+# ---------------------------
+def env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def env_first(names: List[str], default: str = "") -> str:
+    for name in names:
+        value = os.getenv(name, "").strip()
+        if value:
+            return value
+    return default
+
+
+def env_first_int(names: List[str], default: int) -> int:
+    for name in names:
+        raw = os.getenv(name, "").strip()
+        if not raw:
+            continue
+        try:
+            return int(raw)
+        except ValueError:
+            continue
+    return default
+
+
+def resolve_bold_base_url() -> str:
+    base_url = env_first(["BOLD_API_BASE_URL", "AviontePrivateURL", "AVIONTE_PRIVATE_URL"])
+    if base_url:
+        return base_url
+
+    service_url = env_first(["BOLD_SERVICE_URL", "AvionteServiceURL", "AVIONTE_SERVICE_URL"])
+    url_path = env_first(["BOLD_URL_PATH", "AvionteURLPath", "AVIONTE_URL_PATH"])
+    if service_url and url_path:
+        return f"{service_url.rstrip('/')}/{url_path.lstrip('/')}"
+
+    return DEFAULT_BOLD_API_BASE_URL
+
+
+def get_bold_config_from_env() -> Dict[str, Any]:
+    return {
+        "base_url": resolve_bold_base_url(),
+        "auth_url": env_first(["BOLD_AUTH_URL", "AvionteAuthURL", "AVIONTE_AUTH_URL"]),
+        "api_key": env_first(["BOLD_API_KEY", "BOLD_SUBSCRIPTION_KEY", "SubscriptionKey", "SUBSCRIPTION_KEY"]),
+        "tenant": env_first(["BOLD_TENANT", "Tenant", "TENANT"]),
+        "front_office_tenant_id": env_first(
+            ["BOLD_FRONT_OFFICE_TENANT_ID", "FrontOfficeTenantId", "FRONT_OFFICE_TENANT_ID"]
+        ),
+        "client_id": env_first(["BOLD_CLIENT_ID", "ClientID", "CLIENT_ID"]),
+        "client_secret": env_first(["BOLD_CLIENT_SECRET", "ClientSecret", "CLIENT_SECRET"]),
+        "grant_type": env_first(["BOLD_GRANT_TYPE", "grant_type", "GRANT_TYPE"], "client_credentials"),
+        "scope": env_first(["BOLD_SCOPE", "Scope", "SCOPE"]),
+        "auth_timeout": env_first_int(["BOLD_AUTH_TIMEOUT", "AuthTimeOut", "AUTH_TIMEOUT"], 10),
+        "call_timeout": env_first_int(["BOLD_CALL_TIMEOUT", "CallTimeOut", "CALL_TIMEOUT"], 30),
+        "cache_timeout": env_first_int(["BOLD_CACHE_TIMEOUT", "CacheTimeOut", "CACHE_TIMEOUT"], 300),
+        "bearer_token": env_first(["BOLD_BEARER_TOKEN"]),
+    }
+
+
+def get_bold_bearer_token(config: Dict[str, Any], force: bool = False) -> Tuple[bool, str, str]:
+    if requests is None:
+        return False, "", "requests_not_installed"
+
+    configured_bearer = str(config.get("bearer_token") or "").strip()
+    if configured_bearer:
+        return True, configured_bearer, "env_bearer_token"
+
+    auth_url = str(config.get("auth_url") or "").strip()
+    client_id = str(config.get("client_id") or "").strip()
+    client_secret = str(config.get("client_secret") or "").strip()
+    grant_type = str(config.get("grant_type") or "client_credentials").strip() or "client_credentials"
+    scope = str(config.get("scope") or "").strip()
+    api_key = str(config.get("api_key") or "").strip()
+    auth_timeout = max(1, int(config.get("auth_timeout") or 10))
+    cache_timeout = max(1, int(config.get("cache_timeout") or 300))
+
+    missing = [
+        label
+        for label, value in (
+            ("auth_url", auth_url),
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+            ("scope", scope),
+            ("api_key", api_key),
+        )
+        if not value
+    ]
+    if missing:
+        return False, "", f"missing_auth_config:{','.join(missing)}"
+
+    cache_key = f"{auth_url}|{client_id}|{scope}|{api_key}"
+    cache_bucket = st.session_state.setdefault("bold_token_cache", {})
+    now = time.time()
+    cached = cache_bucket.get(cache_key, {})
+    if not force and cached.get("token") and float(cached.get("expires_at") or 0) > now + 5:
+        return True, str(cached["token"]), "cached_token"
+
+    headers = {
+        "x-api-key": api_key,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json",
+    }
+    body_params = {
+        "grant_type": grant_type,
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "scope": scope,
+    }
+
+    try:
+        response = requests.post(auth_url, data=body_params, headers=headers, timeout=auth_timeout)
+    except Exception as exc:
+        return False, "", f"auth_request_error:{exc.__class__.__name__}:{exc}"
+
+    if not response.ok:
+        body_text = (response.text or "").strip()
+        if len(body_text) > 300:
+            body_text = body_text[:300] + "..."
+        return False, "", f"auth_http_{response.status_code}:{body_text or 'empty_response'}"
+
+    try:
+        token_payload = response.json()
+    except Exception:
+        return False, "", "auth_invalid_json"
+
+    access_token = str(token_payload.get("access_token") or "").strip()
+    if not access_token:
+        return False, "", "auth_missing_access_token"
+
+    expires_in = 0
+    try:
+        expires_in = int(token_payload.get("expires_in") or 0)
+    except (TypeError, ValueError):
+        expires_in = 0
+
+    ttl = cache_timeout
+    if expires_in > 90:
+        ttl = min(ttl, expires_in - 60)
+
+    cache_bucket[cache_key] = {
+        "token": access_token,
+        "expires_at": now + max(30, ttl),
+    }
+
+    return True, access_token, "auth_generated"
+
+
+def parse_talent_ids(raw: str) -> List[int]:
+    ids: List[int] = []
+    seen: set[int] = set()
+
+    for token in re.split(r"[,\s]+", raw.strip()):
+        if not token:
+            continue
+
+        match = re.search(r"\d+", token)
+        if not match:
+            continue
+
+        talent_id = int(match.group(0))
+        if talent_id <= 0 or talent_id in seen:
+            continue
+
+        ids.append(talent_id)
+        seen.add(talent_id)
+
+    return ids
+
+
+def build_bold_headers(
+    api_key: str,
+    bearer_token: str,
+    tenant: str,
+    front_office_tenant_id: str,
+) -> Dict[str, str]:
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+
+    if api_key.strip():
+        headers["x-api-key"] = api_key.strip()
+
+    token = bearer_token.strip()
+    if token:
+        if not token.lower().startswith("bearer "):
+            token = f"Bearer {token}"
+        headers["Authorization"] = token
+
+    if tenant.strip():
+        headers["Tenant"] = tenant.strip()
+
+    if front_office_tenant_id.strip():
+        headers["FrontOfficeTenantId"] = front_office_tenant_id.strip()
+
+    return headers
+
+
+def build_hcm_user_payload(
+    row: Dict[str, Any],
+    home_office_id: int,
+    user_type_id: int,
+    email_run_suffix: str = "",
+) -> Dict[str, Any]:
+    row_id = str(row.get("id", "")).strip().lower()
+    email_local_part = re.sub(r"[^a-z0-9]+", "", row_id) or f"hcm{int(time.time())}"
+    if email_run_suffix:
+        email_local_part = f"{email_local_part}-{email_run_suffix}"
+
+    company_name = str(row.get("company_name", "Seed Company")).strip()
+    first_name_parts = [part for part in re.split(r"[^A-Za-z]+", company_name) if part]
+    first_name = (first_name_parts[0] if first_name_parts else "Seed")[:40]
+
+    payload = {
+        "firstName": first_name,
+        "lastName": "User",
+        "emailAddress": f"{email_local_part}@{DEFAULT_HCM_EMAIL_DOMAIN}".lower(),
+        "city": str(row.get("city") or ""),
+        "stateProvince": str(row.get("state") or ""),
+        "country": "US",
+        "homeOfficeId": int(home_office_id),
+        "userTypeId": int(user_type_id),
+        "sendWelcomeEmail": False,
+    }
+
+    return {k: v for k, v in payload.items() if v not in {"", None}}
+
+
+def mask_secret(value: str) -> str:
+    raw = str(value or "")
+    if not raw:
+        return ""
+    if len(raw) <= 8:
+        return "*" * len(raw)
+    return f"{raw[:4]}...{raw[-4:]}"
+
+
+def redact_headers_for_log(headers: Dict[str, str], expose_sensitive: bool = False) -> Dict[str, str]:
+    redacted: Dict[str, str] = {}
+    for key, value in headers.items():
+        if not expose_sensitive and key.lower() in {"authorization", "x-api-key"}:
+            redacted[key] = mask_secret(str(value))
+        else:
+            redacted[key] = str(value)
+    return redacted
+
+
+def post_bold_payload(
+    base_url: str,
+    path: str,
+    headers: Dict[str, str],
+    payload: Dict[str, Any],
+    timeout_seconds: int = 30,
+    expose_sensitive_logs: bool = False,
+) -> Tuple[bool, int, str, Dict[str, Any]]:
+    url = f"{base_url.rstrip('/')}{path}"
+    debug_log: Dict[str, Any] = {
+        "method": "POST",
+        "url": url,
+        "timeout_seconds": int(timeout_seconds),
+        "request_headers": redact_headers_for_log(headers, expose_sensitive=expose_sensitive_logs),
+        "request_payload": payload,
+    }
+
+    if requests is None:
+        debug_log["status_code"] = 0
+        debug_log["ok"] = False
+        debug_log["response_body"] = "requests_not_installed"
+        return False, 0, "requests_not_installed", debug_log
+
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=timeout_seconds)
+
+        try:
+            body_text = json.dumps(response.json())
+        except Exception:
+            body_text = (response.text or "").strip()
+
+        if len(body_text) > 400:
+            body_text = body_text[:400] + "..."
+
+        debug_log["status_code"] = int(response.status_code)
+        debug_log["ok"] = bool(response.ok)
+        debug_log["response_body"] = body_text
+        return response.ok, int(response.status_code), body_text, debug_log
+    except Exception as exc:
+        error_text = f"request_error:{exc.__class__.__name__}:{exc}"
+        debug_log["status_code"] = 0
+        debug_log["ok"] = False
+        debug_log["response_body"] = error_text
+        return False, 0, error_text, debug_log
+
+
+def insert_hcm_users_to_bold(
+    base_url: str,
+    common_headers: Dict[str, str],
+    hcm_rows: List[Dict[str, Any]],
+    home_office_id: int,
+    user_type_id: int,
+    call_timeout_seconds: int,
+    capture_debug_logs: bool,
+    expose_sensitive_logs: bool,
+) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {"attempted": 0, "success": 0, "failed": 0, "errors": [], "debug_logs": []}
+    email_run_suffix = uuid.uuid4().hex[:8]
+
+    for row in hcm_rows:
+        headers = dict(common_headers)
+        headers["RequestId"] = str(uuid.uuid4())
+
+        payload = build_hcm_user_payload(
+            row=row,
+            home_office_id=home_office_id,
+            user_type_id=user_type_id,
+            email_run_suffix=email_run_suffix,
+        )
+        ok, status_code, response_body, debug_log = post_bold_payload(
+            base_url=base_url,
+            path=BOLD_CREATE_HCM_USER_PATH,
+            headers=headers,
+            payload=payload,
+            timeout_seconds=call_timeout_seconds,
+            expose_sensitive_logs=expose_sensitive_logs,
+        )
+
+        if capture_debug_logs and len(summary["debug_logs"]) < 25:
+            debug_log["seed_id"] = row.get("id", "")
+            summary["debug_logs"].append(debug_log)
+
+        summary["attempted"] += 1
+        if ok:
+            summary["success"] += 1
+        else:
+            summary["failed"] += 1
+            if len(summary["errors"]) < 10:
+                summary["errors"].append(
+                    {
+                        "seed_id": row.get("id", ""),
+                        "status_code": status_code,
+                        "response": response_body,
+                        "url": debug_log.get("url", ""),
+                    }
+                )
+
+    return summary
+
+
+def insert_talent_users_to_bold(
+    base_url: str,
+    common_headers: Dict[str, str],
+    talent_ids: List[int],
+    legacy_work_n: bool,
+) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {"attempted": 0, "success": 0, "failed": 0, "errors": []}
+
+    for talent_id in talent_ids:
+        headers = dict(common_headers)
+        headers["RequestId"] = str(uuid.uuid4())
+
+        payload = {
+            "talentId": int(talent_id),
+            "legacyWorkN": bool(legacy_work_n),
+        }
+        ok, status_code, response_body, _ = post_bold_payload(
+            base_url=base_url,
+            path=BOLD_CREATE_TALENT_USER_PATH,
+            headers=headers,
+            payload=payload,
+        )
+
+        summary["attempted"] += 1
+        if ok:
+            summary["success"] += 1
+        else:
+            summary["failed"] += 1
+            if len(summary["errors"]) < 10:
+                summary["errors"].append(
+                    {
+                        "talent_id": talent_id,
+                        "status_code": status_code,
+                        "response": response_body,
+                    }
+                )
+
+    return summary
+
+
+# ---------------------------
 # 4) Benchmarks
 # ---------------------------
 def run_query_benchmarks(hcm_data: List[Dict[str, Any]], talent_data: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -913,7 +1317,7 @@ if schema_bytes is not None:
     relevant = find_relevant_tables(schema["tables"])
     if relevant:
         with st.expander("Detected relevant BOLD tables", expanded=False):
-            st.dataframe(relevant, use_container_width=True)
+            st.dataframe(relevant, width="stretch")
 
 st.subheader("2) LLM profile settings")
 env_gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
@@ -1058,16 +1462,16 @@ if result:
         st.json(result["profile"])
 
     with st.expander("HCM sample", expanded=True):
-        st.dataframe(result["hcm_data"][:10], use_container_width=True)
+        st.dataframe(result["hcm_data"][:10], width="stretch")
 
     with st.expander("Talent sample", expanded=True):
-        st.dataframe(result["talent_data"][:10], use_container_width=True)
+        st.dataframe(result["talent_data"][:10], width="stretch")
 
     if result["benchmarks"]:
         with st.expander("Query benchmark results", expanded=True):
             timings = result["benchmarks"]["timings_ms"]
             timing_rows = [{"query": k, "duration_ms": v} for k, v in timings.items()]
-            st.dataframe(timing_rows, use_container_width=True)
+            st.dataframe(timing_rows, width="stretch")
 
             st.write("Top locations")
             st.dataframe(
@@ -1075,11 +1479,11 @@ if result:
                     {"location": location, "count": count}
                     for location, count in result["benchmarks"]["outputs"]["talent_by_location"]
                 ],
-                use_container_width=True,
+                width="stretch",
             )
 
             st.write("Average salary by title")
-            st.dataframe(result["benchmarks"]["outputs"]["avg_salary_by_title"][:10], use_container_width=True)
+            st.dataframe(result["benchmarks"]["outputs"]["avg_salary_by_title"][:10], width="stretch")
 
     st.subheader("4) Download")
     if "JSON" in output_format:
@@ -1107,6 +1511,110 @@ if result:
             file_name="bold_seed_inserts.sql",
             mime="application/sql",
         )
+
+    st.subheader("5) Insert to BOLD API")
+    with st.expander("Insert generated users into BOLD", expanded=False):
+        bold_config = get_bold_config_from_env()
+        st.caption(
+            "Calls CreateHCMUser (POST /v1/user) using .env credentials and auto-generated access token. "
+            "Talent user insertion will be added later."
+        )
+
+        scope_mode = "Tenant" if bold_config["tenant"] else "FrontOfficeTenantId" if bold_config["front_office_tenant_id"] else "missing"
+        st.caption(f"Base URL: {bold_config['base_url']}")
+        st.caption(f"Tenant scope header: {scope_mode}")
+
+        home_office_id = env_first_int(["BOLD_HOME_OFFICE_ID", "HomeOfficeId", "HOME_OFFICE_ID"], 1)
+        user_type_id = env_first_int(["BOLD_USER_TYPE_ID", "UserTypeId", "USER_TYPE_ID"], 1)
+
+        max_rows_to_push = st.number_input(
+            "Max HCM rows to push",
+            min_value=1,
+            max_value=5000,
+            value=50,
+            step=10,
+        )
+
+        hcm_rows_to_push = result["hcm_data"][: int(max_rows_to_push)]
+
+        st.caption(f"Ready to push: HCM={len(hcm_rows_to_push)} row(s).")
+        capture_debug_logs = st.checkbox(
+            "Capture detailed API logs (URL, headers, payload, response)",
+            value=True,
+        )
+        expose_sensitive_logs = False
+        if capture_debug_logs:
+            expose_sensitive_logs = st.checkbox(
+                "Expose Authorization/x-api-key/access token in logs (unsafe)",
+                value=False,
+            )
+
+        if st.button("Insert HCM users to BOLD", type="secondary"):
+            if requests is None:
+                st.error("`requests` is not installed. Install dependencies from requirements.txt and retry.")
+            elif not bold_config["base_url"]:
+                st.error("BOLD API base URL is required.")
+            elif not (bold_config["tenant"] or bold_config["front_office_tenant_id"]):
+                st.error("Provide Tenant or FrontOfficeTenantId header value.")
+            elif not hcm_rows_to_push:
+                st.warning("No HCM rows available to push. Generate HCM data first.")
+            else:
+                token_ok, bearer_token, token_status = get_bold_bearer_token(bold_config)
+                if not token_ok:
+                    st.error(
+                        "Unable to generate BOLD access token from .env settings "
+                        f"({token_status})."
+                    )
+                else:
+                    common_headers = build_bold_headers(
+                        api_key=bold_config["api_key"],
+                        bearer_token=bearer_token,
+                        tenant=bold_config["tenant"],
+                        front_office_tenant_id=bold_config["front_office_tenant_id"],
+                    )
+
+                    if capture_debug_logs and expose_sensitive_logs:
+                        st.warning("Sensitive debug mode is ON. Do not share these values in screenshots.")
+                        st.text_area(
+                            "Authorization header (copy to Postman)",
+                            value=common_headers.get("Authorization", ""),
+                            height=70,
+                        )
+                        st.text_area(
+                            "Access token (copy to Postman)",
+                            value=bearer_token,
+                            height=110,
+                        )
+
+                    hcm_summary = {"attempted": 0, "success": 0, "failed": 0, "errors": []}
+
+                    with st.spinner("Calling CreateHCMUser endpoint..."):
+                        hcm_summary = insert_hcm_users_to_bold(
+                            base_url=bold_config["base_url"],
+                            common_headers=common_headers,
+                            hcm_rows=hcm_rows_to_push,
+                            home_office_id=int(home_office_id),
+                            user_type_id=int(user_type_id),
+                            call_timeout_seconds=max(1, int(bold_config["call_timeout"])),
+                            capture_debug_logs=capture_debug_logs,
+                            expose_sensitive_logs=expose_sensitive_logs,
+                        )
+
+                    st.caption(f"Access token source: {token_status}")
+                    st.write("CreateHCMUser results")
+                    st.write(
+                        f"Attempted: {hcm_summary['attempted']} | "
+                        f"Succeeded: {hcm_summary['success']} | Failed: {hcm_summary['failed']}"
+                    )
+                    if hcm_summary["errors"]:
+                        st.dataframe(hcm_summary["errors"], width="stretch")
+
+                    if capture_debug_logs and hcm_summary["debug_logs"]:
+                        with st.expander("Detailed API debug logs", expanded=True):
+                            st.json(hcm_summary["debug_logs"])
+
+                    if hcm_summary["failed"] == 0 and hcm_summary["attempted"] > 0:
+                        st.success("CreateHCMUser insertion completed successfully.")
 
 else:
     st.info("Upload a schema, choose options, then click Generate.")
